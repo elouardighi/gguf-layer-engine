@@ -1,0 +1,117 @@
+// AI Studio schema — models, layers, chat, downloads
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+/// A GGUF model repo downloaded (or queued) from Hugging Face
+model Model {
+  id           String   @id @default(cuid())
+  /// Hugging Face repo id, e.g. "Qwen/Qwen3-8B-UD-Q4_K_XL-layers"
+  repo         String
+  /// Human friendly name
+  name         String
+  /// Branch / revision
+  revision     String   @default("main")
+  /// Quantisation label, e.g. "Q4_K_XL"
+  quant        String?
+  /// Total size in bytes (sum of all layer files)
+  sizeBytes    BigInt   @default(0)
+  /// Number of layer files
+  layersCount  Int      @default(0)
+  /// Architecture family (Qwen, Llama, Mistral...)
+  family       String?
+  /// Local path under ./models/<repo-slug>
+  localPath    String?
+  /// Status: pending | downloading | ready | error
+  status       String   @default("pending")
+  /// Default context window the user wants
+  contextSize  Int      @default(8192)
+  /// Inference engine hint
+  engine       String   @default("auto")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  layers       Layer[]
+  sessions     ChatSession[]
+  downloads    HfDownload[]
+}
+
+/// A single .gguf layer file inside a model
+model Layer {
+  id          String   @id @default(cuid())
+  modelId     String
+  /// Zero-padded layer index, e.g. 0, 1, 2...
+  index       Int
+  /// File name, e.g. "layer-00000.gguf"
+  fileName    String
+  /// File size in bytes
+  sizeBytes   BigInt
+  /// Where the layer currently lives: gpu | ram | nvme
+  location    String   @default("nvme")
+  /// True when the user has manually pinned it to GPU
+  pinned      Boolean  @default(false)
+  /// Mean time spent on this layer during the last forward pass (ms)
+  lastMs      Float    @default(0)
+  /// Number of times this layer was touched
+  hits        Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  model       Model    @relation(fields: [modelId], references: [id], onDelete: Cascade)
+
+  @@unique([modelId, index])
+  @@index([modelId, location])
+}
+
+/// A conversation session bound to a model
+model ChatSession {
+  id            String   @id @default(cuid())
+  modelId       String
+  title         String   @default("New chat")
+  systemPrompt  String   @default("")
+  temperature   Float    @default(0.7)
+  topP          Float    @default(0.95)
+  maxTokens     Int      @default(2048)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  model         Model    @relation(fields: [modelId], references: [id], onDelete: Cascade)
+  messages      ChatMessage[]
+}
+
+/// One chat message
+model ChatMessage {
+  id            String   @id @default(cuid())
+  sessionId     String
+  role          String   /// user | assistant | system
+  content       String
+  tokensIn      Int      @default(0)
+  tokensOut     Int      @default(0)
+  tokensPerSec  Float    @default(0)
+  /// Strategy snapshot when this message was generated
+  strategy      String   @default("balanced")
+  createdAt     DateTime @default(now())
+
+  session       ChatSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+}
+
+/// Track an in-flight HF download
+model HfDownload {
+  id              String   @id @default(cuid())
+  modelId         String
+  fileName        String
+  totalBytes      BigInt   @default(0)
+  downloadedBytes BigInt   @default(0)
+  /// pending | running | done | failed
+  status          String   @default("pending")
+  error           String?
+  startedAt       DateTime @default(now())
+  finishedAt      DateTime?
+  model           Model    @relation(fields: [modelId], references: [id], onDelete: Cascade)
+}
