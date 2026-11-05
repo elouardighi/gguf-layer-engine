@@ -6,10 +6,10 @@ import { Badge } from "@/components/ui/badge"
 import { Zap, Scale, MemoryStick, Hand, Gauge } from "lucide-react"
 
 const STRATEGIES: { id: Strategy; label: string; icon: React.ReactNode; desc: string }[] = [
-  { id: "speed", label: "Speed", icon: <Zap className="h-3 w-3" />, desc: "Max VRAM fill — greedy GPU placement, lowest latency" },
-  { id: "balanced", label: "Balanced", icon: <Scale className="h-3 w-3" />, desc: "70% hot layers in VRAM, oldest 30% on NVMe" },
-  { id: "memory", label: "Memory", icon: <MemoryStick className="h-3 w-3" />, desc: "Rolling window of N layers in VRAM — smallest footprint" },
-  { id: "manual", label: "Manual", icon: <Hand className="h-3 w-3" />, desc: "Only user-pinned layers in VRAM; everything else cold" },
+  { id: "speed", label: "Speed", icon: <Zap className="h-3 w-3" />, desc: "Largest GPU prefix (~71% VRAM) — fastest tokens, most VRAM used" },
+  { id: "balanced", label: "Balanced", icon: <Scale className="h-3 w-3" />, desc: "~57% of VRAM as a GPU prefix — the rest is mmap'd from RAM/NVMe" },
+  { id: "memory", label: "Memory", icon: <MemoryStick className="h-3 w-3" />, desc: "~40% GPU prefix — smallest VRAM footprint, more paging" },
+  { id: "manual", label: "Manual", icon: <Hand className="h-3 w-3" />, desc: "Offload only through your last GPU-pinned layer" },
 ]
 
 export function LayerControls() {

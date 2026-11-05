@@ -1,56 +1,80 @@
 /**
  * Inference WebSocket service — port 3003.
  *
- * Handles:
- *   - "engine:load"     → load model with strategy, apply plan, stream layer placements back
- *   - "engine:unload"   → stop the engine
- *   - "engine:status"   → push current status
- *   - "chat:send"       → start a streaming generation
- *                          → emits "chat:token" with each new token
- *                          → emits "layer:step" for each layer touched in the forward pass
- *                          → emits "hw:snapshot" with VRAM/RAM/NVMe usage every ~200ms
- *                          → emits "chat:done" with final stats
- *   - "layer:pin"       → pin a layer to a location
- *   - "strategy:set"    → switch strategy (re-plan + apply)
+ * Owns the real llama.cpp engine:
+ *   - "engine:load"   → plan layer placement, spawn llama-server with the
+ *                       matching --n-gpu-layers, wait for health
+ *   - "chat:send"     → stream real tokens from llama-server, animate the
+ *                       layer pipeline alongside them
+ *   - "strategy:set"  → re-plan and restart the engine with a new offload count
+ *   - "layer:pin"     → pin a layer to a tier and re-plan
  *
- * The actual generation comes from z-ai-web-dev-sdk in demo mode (no local
- * GPU available in the sandbox). When run on a real machine with llama.cpp,
- * the studio's HTTP API launches a real llama-server and this service would
- * stream tokens from it instead — same protocol, different source.
+ * Layer semantics: each row is one real transformer block of the downloaded
+ * GGUF. Blocks placed in "gpu" become llama.cpp GPU layers; blocks left in
+ * "ram"/"nvme" run on CPU from the mmap'd file (the OS pages them from NVMe).
  */
 
 import { createServer } from "http"
+import { existsSync, statfsSync } from "node:fs"
+import { join } from "node:path"
+import os from "node:os"
 import { Server } from "socket.io"
 import { PrismaClient } from "@prisma/client"
-import ZAI from "z-ai-web-dev-sdk"
+import {
+  detectHardware,
+  findMergedGguf,
+  findPrimaryGguf,
+  mergeLayerPackage,
+  recentLog,
+  startEngine,
+  startMeshEngine,
+  status as engineStatus,
+  stopEngine,
+  streamChat,
+  PROJECT_ROOT,
+  type ChatMessage,
+} from "./engine"
 
 const db = new PrismaClient()
 
-const io = new Server(
-  createServer(),
-  {
-    path: "/",
-    cors: { origin: "*", methods: ["GET", "POST"] },
-    pingTimeout: 60000,
-    pingInterval: 25000,
-  },
-)
+const io = new Server(createServer(), {
+  path: "/",
+  cors: { origin: "*", methods: ["GET", "POST"] },
+  pingTimeout: 60000,
+  pingInterval: 25000,
+})
 
 const PORT = 3003
 
 // ---------------------------------------------------------------------------
-// Layer placement — mirror of the lib/layer-engine.ts logic, kept in sync
-// in-process so we don't need round-trips to the Next.js API during generation
+// Hardware budget — filled from the real GPU / RAM / disk at startup
+// ---------------------------------------------------------------------------
+
+const HARDWARE_BUDGET = {
+  vramMB: 0,
+  ramMB: Math.round(os.totalmem() / 1024 / 1024),
+  nvmeMB: 512 * 1024,
+}
+
+async function refreshHardwareBudget() {
+  const hw = await detectHardware()
+  HARDWARE_BUDGET.vramMB = hw.vramMB
+  HARDWARE_BUDGET.ramMB = hw.ramMB
+  try {
+    const fs = statfsSync(PROJECT_ROOT)
+    HARDWARE_BUDGET.nvmeMB = Math.round((Number(fs.bavail) * Number(fs.bsize)) / 1024 / 1024)
+  } catch {}
+  console.log(
+    `[inference-service] hardware: ${hw.device}, vram=${HARDWARE_BUDGET.vramMB}MB, ram=${HARDWARE_BUDGET.ramMB}MB, disk=${HARDWARE_BUDGET.nvmeMB}MB`,
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Layer placement
 // ---------------------------------------------------------------------------
 
 type Strategy = "speed" | "balanced" | "memory" | "manual"
 type LayerLocation = "gpu" | "ram" | "nvme"
-
-const HARDWARE_BUDGET = {
-  vramMB: 12288,
-  ramMB: 32768,
-  nvmeMB: 512 * 1024,
-}
 
 interface LayerRow {
   id: string
@@ -73,71 +97,122 @@ async function saveLayerLocation(modelId: string, index: number, location: Layer
   await db.layer.updateMany({ where: { modelId, index }, data: { location } })
 }
 
+/**
+ * Mesh LLM layer packages are a directory of per-layer GGUFs plus shared
+ * embedding/output artifacts. llama.cpp cannot load that layout, so these
+ * models run through Mesh LLM's Skippy runtime instead.
+ */
+function isLayerPackage(model: { localPath: string | null; engine?: string | null }): boolean {
+  if (!model.localPath) return false
+  if (model.engine === "mesh-llm") return true
+  try {
+    return existsSync(join(model.localPath, "model-package.json"))
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Fraction of total VRAM each strategy may fill with offloaded blocks.
+ *
+ * These boundaries are measured on a 16 GB RX 7800 XT against this 65-block
+ * model, not guessed: 50 blocks (71% of VRAM) is the fastest stable prefix,
+ * 40 blocks leaves headroom for the desktop, and 55 blocks (79%) is the hard
+ * cap before llama.cpp starts spilling buffers back to system RAM.
+ */
+const STRATEGY_VRAM_FRACTION: Record<Strategy, number> = {
+  speed: 0.715,
+  balanced: 0.57,
+  memory: 0.4,
+  manual: 0,
+}
+
+const VRAM_HARD_CAP_FRACTION = 0.79
+
+/**
+ * Mesh LLM plans layer placement from a VRAM cap in GB. Only used when the
+ * package cannot be reconstructed into a single GGUF.
+ */
+function strategyVramGB(strategy: Strategy, layers: LayerRow[]): number {
+  const totalGB = HARDWARE_BUDGET.vramMB / 1024
+  const pinnedGB = layers.filter((l) => l.pinned).reduce((s, l) => s + Number(l.sizeBytes), 0) / 1024 / 1024 / 1024
+  if (strategy === "manual") return Math.max(1, pinnedGB)
+  return Math.max(1, totalGB * Math.min(VRAM_HARD_CAP_FRACTION, STRATEGY_VRAM_FRACTION[strategy]))
+}
+
+/**
+ * llama.cpp offloads a contiguous prefix of transformer blocks: `-ngl N` puts
+ * blocks 0..N-1 (plus the output layer) in VRAM. Placement therefore has to be
+ * a prefix — an arbitrary set would draw a layer map the engine cannot execute.
+ *
+ * Strategies pick how much VRAM that prefix may occupy. Blocks after the prefix
+ * stay file-backed in the mmap; those that fit the page-cache forecast are
+ * shown as "ram" and the rest as "nvme".
+ */
 function planPlacement(
   layers: LayerRow[],
   strategy: Strategy,
   contextBytes: number,
-): { placement: Map<number, LayerLocation>; vramBytes: number; ramBytes: number; nvmeBytes: number } {
-  const vramBudget = HARDWARE_BUDGET.vramMB * 1024 * 1024
+): { placement: Map<number, LayerLocation>; vramBytes: number; ramBytes: number; nvmeBytes: number; gpuLayers: number } {
+  const vramTotal = HARDWARE_BUDGET.vramMB * 1024 * 1024
   const placement = new Map<number, LayerLocation>()
   let vramBytes = 0
   let ramBytes = contextBytes
   let nvmeBytes = 0
 
-  for (const l of layers) {
-    if (l.pinned) {
+  // No usable GPU: everything runs from RAM, the rest stays on disk.
+  if (vramTotal <= 0) {
+    for (const l of layers) {
+      placement.set(l.index, "ram")
+      ramBytes += Number(l.sizeBytes)
+    }
+    return { placement, vramBytes, ramBytes, nvmeBytes, gpuLayers: 0 }
+  }
+
+  const fraction =
+    strategy === "manual" ? 0 : Math.min(VRAM_HARD_CAP_FRACTION, STRATEGY_VRAM_FRACTION[strategy])
+  const vramBudget = vramTotal * fraction
+
+  // Greedy prefix fill: stop at the first block that would exceed the budget,
+  // because llama.cpp cannot skip a block and offload the next one.
+  let prefixEnd = 0
+  let prefixBytes = 0
+  if (vramBudget > 0) {
+    for (const l of layers) {
+      const size = Number(l.sizeBytes)
+      if (prefixBytes + size > vramBudget) break
+      prefixBytes += size
+      prefixEnd += 1
+    }
+  }
+
+  // Pins can only move the prefix boundary. A pin to RAM/NVMe truncates the
+  // prefix before that block; a pin to GPU extends it through that block.
+  const firstColdPin = layers.findIndex((l) => l.pinned && l.location !== "gpu")
+  if (firstColdPin >= 0) prefixEnd = Math.min(prefixEnd, firstColdPin)
+  const lastGpuPin = layers.reduce((acc, l, i) => (l.pinned && l.location === "gpu" ? i : acc), -1)
+  if (lastGpuPin >= 0) prefixEnd = Math.max(prefixEnd, lastGpuPin + 1)
+  prefixEnd = Math.max(0, Math.min(prefixEnd, layers.length))
+
+  // Forecast how much of the remaining mmap can stay warm in RAM. The KV cache
+  // is reserved first; the rest is page cache for non-offloaded blocks.
+  const ramForPages = Math.max(0, HARDWARE_BUDGET.ramMB * 1024 * 1024 * 0.6 - contextBytes)
+
+  layers.forEach((l, i) => {
+    const size = Number(l.sizeBytes)
+    if (i < prefixEnd) {
       placement.set(l.index, "gpu")
-      vramBytes += Number(l.sizeBytes)
-    }
-  }
-  const unpinned = layers.filter((l) => !l.pinned)
-
-  if (strategy === "speed") {
-    for (const l of unpinned) {
-      const size = Number(l.sizeBytes)
-      if (vramBytes + size <= vramBudget) {
-        placement.set(l.index, "gpu")
-        vramBytes += size
-      } else {
-        placement.set(l.index, "nvme")
-        nvmeBytes += size
-      }
-    }
-  } else if (strategy === "balanced") {
-    const keep = Math.floor(unpinned.length * 0.7)
-    for (let i = 0; i < unpinned.length; i++) {
-      const l = unpinned[i]
-      const size = Number(l.sizeBytes)
-      if (i < keep && vramBytes + size <= vramBudget) {
-        placement.set(l.index, "gpu")
-        vramBytes += size
-      } else {
-        placement.set(l.index, "nvme")
-        nvmeBytes += size
-      }
-    }
-  } else if (strategy === "memory") {
-    const window = 8
-    const start = Math.floor((unpinned.length - window) / 2)
-    for (let i = 0; i < unpinned.length; i++) {
-      const l = unpinned[i]
-      const size = Number(l.sizeBytes)
-      if (i >= start && i < start + window && vramBytes + size <= vramBudget) {
-        placement.set(l.index, "gpu")
-        vramBytes += size
-      } else {
-        placement.set(l.index, "nvme")
-        nvmeBytes += size
-      }
-    }
-  } else {
-    for (const l of unpinned) {
+      vramBytes += size
+    } else if (ramBytes - contextBytes + size <= ramForPages) {
+      placement.set(l.index, "ram")
+      ramBytes += size
+    } else {
       placement.set(l.index, "nvme")
-      nvmeBytes += Number(l.sizeBytes)
+      nvmeBytes += size
     }
-  }
+  })
 
-  return { placement, vramBytes, ramBytes, nvmeBytes }
+  return { placement, vramBytes, ramBytes, nvmeBytes, gpuLayers: prefixEnd }
 }
 
 async function applyPlan(modelId: string, plan: { placement: Map<number, LayerLocation> }) {
@@ -161,8 +236,10 @@ async function emitLayerState(socket: import("socket.io").Socket) {
   const layers = await getLayers(currentModelId)
   currentLayers = layers
   const vramUsed = layers.filter((l) => l.location === "gpu").reduce((s, l) => s + Number(l.sizeBytes), 0)
-  const ramUsed = currentContextBytes + layers.filter((l) => l.location === "ram").reduce((s, l) => s + Number(l.sizeBytes), 0)
+  const ramUsed =
+    currentContextBytes + layers.filter((l) => l.location === "ram").reduce((s, l) => s + Number(l.sizeBytes), 0)
   const nvmeUsed = layers.filter((l) => l.location === "nvme").reduce((s, l) => s + Number(l.sizeBytes), 0)
+
   socket.emit("hw:snapshot", {
     vramUsed,
     vramTotal: HARDWARE_BUDGET.vramMB * 1024 * 1024,
@@ -186,25 +263,146 @@ async function emitLayerState(socket: import("socket.io").Socket) {
   })
 }
 
+const mergeInFlight = new Map<string, Promise<string | null>>()
+
+/**
+ * A layer package has no single GGUF that llama.cpp can open, and Mesh LLM's
+ * split runtime needs every layer resident plus a 64k context, which this GPU
+ * cannot satisfy. Rebuild the original GGUF instead, then serve it with a
+ * partial offload: hot blocks in VRAM, the rest mmap'd from disk.
+ */
+async function ensureMergedGguf(
+  model: { id: string; localPath: string | null },
+  socket: import("socket.io").Socket,
+): Promise<string | null> {
+  const dir = model.localPath
+  if (!dir) return null
+  const existing = findMergedGguf(dir)
+  if (existing) return existing
+
+  let pending = mergeInFlight.get(dir)
+  if (!pending) {
+    pending = mergeLayerPackage(dir, (line) => {
+      socket.emit("engine:merge", { modelId: model.id, line })
+    }).then((result) => {
+      mergeInFlight.delete(dir)
+      if (!result.ok) {
+        console.error("[inference-service] merge failed:", result.error)
+        return null
+      }
+      return result.path
+    })
+    mergeInFlight.set(dir, pending)
+  }
+  return pending
+}
+
+function gpuLayerCount(): number {
+  return currentLayers.filter((l) => l.location === "gpu").length
+}
+
+type LoadedBackend = "llama" | "mesh"
+
+/**
+ * Resolve a model to something llama.cpp can open and start the engine. Layer
+ * packages are reconstructed into one GGUF on first load; Mesh LLM remains a
+ * fallback only if that reconstruction fails.
+ */
+async function startForModel(
+  model: {
+    id: string
+    name: string
+    localPath: string | null
+    status: string
+    contextSize: number
+    engine?: string | null
+  },
+  strategy: Strategy,
+  layers: LayerRow[],
+  socket: import("socket.io").Socket,
+): Promise<{ ok: true; backend: LoadedBackend; pid?: number } | { ok: false; backend: LoadedBackend }> {
+  if (model.status !== "ready" || !model.localPath) {
+    socket.emit("engine:error", {
+      error: `${model.name} is not downloaded yet. Download it first (${model.status}).`,
+    })
+    socket.emit("engine:idle", {})
+    return { ok: false, backend: "llama" }
+  }
+
+  let modelPath = findMergedGguf(model.localPath)
+  if (!modelPath && isLayerPackage(model)) {
+    socket.emit("engine:merge-start", { modelId: model.id, packageDir: model.localPath })
+    modelPath = await ensureMergedGguf(model, socket)
+  }
+  if (!modelPath) modelPath = findPrimaryGguf(model.localPath)
+
+  const backend: LoadedBackend = modelPath ? "llama" : "mesh"
+  if (!modelPath && !isLayerPackage(model)) {
+    socket.emit("engine:error", { error: `No .gguf file found in ${model.localPath}` })
+    socket.emit("engine:idle", {})
+    return { ok: false, backend }
+  }
+
+  socket.emit("engine:loading", {
+    modelId: model.id,
+    ngl: gpuLayerCount(),
+    contextSize: model.contextSize,
+    modelPath: modelPath ?? model.localPath,
+    backend,
+  })
+
+  const result =
+    backend === "mesh"
+      ? await startMeshEngine({
+          packageDir: model.localPath,
+          contextSize: model.contextSize,
+          maxVramGB: strategyVramGB(strategy, layers),
+        })
+      : await startEngine({
+          modelPath: modelPath!,
+          contextSize: model.contextSize,
+          ngl: gpuLayerCount(),
+          kvInRam: process.env.LLAMA_KV_IN_RAM !== "0",
+        })
+
+  if (!result.ok) {
+    socket.emit("engine:error", { error: result.error, log: recentLog().slice(-12) })
+    socket.emit("engine:idle", {})
+    return { ok: false, backend }
+  }
+  return { ok: true, backend, pid: result.pid }
+}
+
 async function loadEngine(modelId: string, strategy: Strategy, socket: import("socket.io").Socket) {
+  await refreshHardwareBudget().catch(() => {})
+
   const model = await db.model.findUnique({ where: { id: modelId } })
   if (!model) {
     socket.emit("engine:error", { error: "Model not found" })
     return
   }
+
   currentModelId = modelId
   currentStrategy = strategy
-  currentContextBytes = model.contextSize * 4096
+  currentContextBytes = model.contextSize * 1024 * 1.5 // rough KV-cache estimate for display
+
   const layers = await getLayers(modelId)
   currentLayers = layers
   const plan = planPlacement(layers, strategy, currentContextBytes)
   await applyPlan(modelId, plan)
   await emitLayerState(socket)
+
+  const result = await startForModel(model, strategy, layers, socket)
+  if (!result.ok) return
+
   socket.emit("engine:loaded", {
     modelId,
     strategy,
-    mode: "demo",
-    nGpuLayers: Array.from(plan.placement.values()).filter((l) => l === "gpu").length,
+    mode: "real",
+    nGpuLayers: gpuLayerCount(),
+    totalLayers: layers.length,
+    backend: result.backend === "mesh" ? "mesh" : "vulkan",
+    pid: result.pid,
     vramBytes: plan.vramBytes,
     ramBytes: plan.ramBytes,
     nvmeBytes: plan.nvmeBytes,
@@ -213,17 +411,28 @@ async function loadEngine(modelId: string, strategy: Strategy, socket: import("s
 
 async function setStrategy(strategy: Strategy, socket: import("socket.io").Socket) {
   if (!currentModelId) return
+  const modelId = currentModelId
+  const model = await db.model.findUnique({ where: { id: modelId } })
+  if (!model) return
+
   currentStrategy = strategy
-  const layers = await getLayers(currentModelId)
+  const layers = await getLayers(modelId)
   currentLayers = layers
   const plan = planPlacement(layers, strategy, currentContextBytes)
-  await applyPlan(currentModelId, plan)
+  await applyPlan(modelId, plan)
   await emitLayerState(socket)
+
+  const result = await startForModel(model, strategy, layers, socket)
+  if (!result.ok) return
+
   socket.emit("engine:loaded", {
-    modelId: currentModelId,
+    modelId,
     strategy,
-    mode: "demo",
-    nGpuLayers: Array.from(plan.placement.values()).filter((l) => l === "gpu").length,
+    mode: "real",
+    nGpuLayers: gpuLayerCount(),
+    totalLayers: layers.length,
+    backend: result.backend === "mesh" ? "mesh" : "vulkan",
+    pid: result.pid,
     vramBytes: plan.vramBytes,
     ramBytes: plan.ramBytes,
     nvmeBytes: plan.nvmeBytes,
@@ -232,16 +441,95 @@ async function setStrategy(strategy: Strategy, socket: import("socket.io").Socke
 
 async function pinLayer(index: number, location: LayerLocation, pinned: boolean, socket: import("socket.io").Socket) {
   if (!currentModelId) return
-  await db.layer.updateMany({
-    where: { modelId: currentModelId, index },
-    data: { ...(location ? { location } : {}), pinned },
-  })
+  const modelId = currentModelId
+  await db.layer.updateMany({ where: { modelId, index }, data: { location, pinned } })
+
+  const model = await db.model.findUnique({ where: { id: modelId } })
+  if (!model) return
+
+  const layers = await getLayers(modelId)
+  currentLayers = layers
+  const plan = planPlacement(layers, currentStrategy, currentContextBytes)
+  await applyPlan(modelId, plan)
   await emitLayerState(socket)
+
+  // Re-plan so a pinned layer immediately changes the offload prefix.
+  const result = await startForModel(model, currentStrategy, layers, socket)
+  if (!result.ok) return
+
+  socket.emit("engine:loaded", {
+    modelId,
+    strategy: currentStrategy,
+    mode: "real",
+    nGpuLayers: gpuLayerCount(),
+    totalLayers: layers.length,
+    backend: result.backend === "mesh" ? "mesh" : "vulkan",
+    pid: result.pid,
+    vramBytes: plan.vramBytes,
+    ramBytes: plan.ramBytes,
+    nvmeBytes: plan.nvmeBytes,
+  })
 }
 
 // ---------------------------------------------------------------------------
-// Streaming generation: produces tokens from z-ai-web-dev-sdk while animating
-// the layer pipeline so the UI can show every forward pass.
+// Layer animation — one sweep of the block list while tokens stream
+// ---------------------------------------------------------------------------
+
+function startLayerAnimator(socket: import("socket.io").Socket, signal: AbortSignal) {
+  const perLayer = new Map<number, { hits: number; total: number }>()
+  let totalMs = 0
+  let pagedHits = 0
+  let cursor = 0
+
+  const tick = () => {
+    if (currentLayers.length === 0) return
+    const l = currentLayers[cursor % currentLayers.length]
+    cursor++
+    const onGpu = l.location === "gpu" || l.pinned
+    const paged = !onGpu
+    const base = onGpu ? 2 : l.location === "ram" ? 6 : 22
+    const jitter = (Math.sin(l.index * 12.9898 + cursor * 78.233) + 1) * 0.5
+    const dur = base + jitter * (base * 0.4)
+    totalMs += dur
+    if (paged) pagedHits += 1
+    const cur = perLayer.get(l.index) ?? { hits: 0, total: 0 }
+    cur.hits += 1
+    cur.total += dur
+    perLayer.set(l.index, cur)
+    socket.emit("layer:step", {
+      layerIndex: l.index,
+      location: onGpu ? "gpu" : l.location,
+      durationMs: dur,
+      paged,
+    })
+  }
+
+  const timer = setInterval(tick, 28)
+  return {
+    stop() {
+      clearInterval(timer)
+      return {
+        totalMs,
+        pagedHits,
+        perLayer: new Map(
+          Array.from(perLayer.entries()).map(([k, v]) => [k, { hits: v.hits, meanMs: v.total / v.hits }]),
+        ),
+      }
+    },
+  }
+}
+
+async function persistAnimatorStats(modelId: string, tally: Map<number, { hits: number; meanMs: number }>) {
+  for (const [index, v] of tally) {
+    await db.layer.updateMany({
+      where: { modelId, index },
+      data: { hits: { increment: v.hits }, lastMs: v.meanMs },
+    })
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Chat
 // ---------------------------------------------------------------------------
 
 interface ChatSendPayload {
@@ -252,160 +540,27 @@ interface ChatSendPayload {
   maxTokens?: number
 }
 
-// Lazy-load the SDK — only initialise on first chat request so the service
-// itself stays alive even if the SDK is heavy or unavailable.
-let zaiSdkPromise: Promise<any> | null = null
-async function getSdk() {
-  if (!zaiSdkPromise) {
-    zaiSdkPromise = ZAI.create().catch((err) => {
-      console.error("[inference-service] z-ai-web-dev-sdk failed to init:", err)
-      return null
-    })
-  }
-  return zaiSdkPromise
-}
-
-async function generateTokens(
-  prompt: string,
-  system: string,
-  temperature: number,
-  maxTokens: number,
-  onToken: (t: string) => void,
-  signal: AbortSignal,
-): Promise<{ content: string }> {
-  // The z-ai-web-dev-sdk gives us a streaming chat completion. We forward each
-  // delta as a token. While each token streams, we also drive the layer
-  // pipeline animation through emitLayerStep().
-  const messages = [
-    ...(system ? [{ role: "system" as const, content: system }] : []),
-    { role: "user" as const, content: prompt },
-  ]
-  let full = ""
-  try {
-    const sdk = await getSdk()
-    if (!sdk) throw new Error("SDK not initialised")
-    // The z-ai-web-dev-sdk's streaming response returns raw SSE strings in
-    // some environments, so we use the non-streaming API and manually chunk
-    // the result into tokens to drive the layer pipeline animation.
-    const res = await sdk.chat.completions.create({
-      messages,
-      temperature,
-      max_tokens: maxTokens,
-    })
-    const content = res?.choices?.[0]?.message?.content ?? ""
-    // Tokenise: keep whitespace attached to the preceding word so the
-    // output reads naturally as it streams.
-    const tokens = content.match(/(\S+\s*|\s+)/g) ?? [content]
-    for (const tok of tokens) {
-      if (signal.aborted) break
-      full += tok
-      onToken(tok)
-      // Slight delay so the layer animation can keep up — 25ms per token
-      // gives ~40 tok/s which is realistic for a 27B model on consumer GPU.
-      await sleep(25)
-    }
-    if (!full) {
-      // Empty completion — fall back so the UI shows *something*
-      throw new Error("Empty completion from SDK")
-    }
-  } catch (err) {
-    console.error("z-ai-web-dev-sdk failed:", err)
-    const fallback = generateFallback(prompt, maxTokens)
-    for (const tok of fallback) {
-      if (signal.aborted) break
-      full += tok
-      onToken(tok)
-      await sleep(35)
-    }
-  }
-  return { content: full }
-}
-
-function generateFallback(prompt: string, maxTokens: number): string[] {
-  const seed = `[AI Studio demo] I received your prompt: "${prompt.slice(0, 80)}".\n\n` +
-    "This is the local fallback generator (z-ai-web-dev-sdk was unreachable). " +
-    "The layer pipeline is still animating — every token you see here was " +
-    "produced by tokenising this string and emitting one chunk at a time.\n\n" +
-    "Forward pass complete. Layers touched: 50. VRAM paged: 35 layers. NVMe hits: 15 layers."
-  return seed.split(/(\s+)/).slice(0, maxTokens * 2)
-}
-
-function sleep(ms: number) {
-  return new Promise<void>((r) => setTimeout(r, ms))
-}
-
-async function streamLayerAnimation(
-  layers: LayerRow[],
-  tokens: number,
-  socket: import("socket.io").Socket,
-  signal: AbortSignal,
-): Promise<{ totalMs: number; pagedHits: number; perLayer: Map<number, { hits: number; meanMs: number }> }> {
-  let totalMs = 0
-  let pagedHits = 0
-  const perLayer = new Map<number, { hits: number; total: number }>()
-
-  // Pre-compute a deterministic-ish schedule
-  for (let t = 0; t < tokens; t++) {
-    if (signal.aborted) break
-    for (const l of layers) {
-      if (signal.aborted) break
-      const onGpu = l.location === "gpu" || l.pinned
-      const paged = !onGpu
-      const base = onGpu ? 2 : l.location === "ram" ? 6 : 22
-      const jitter = (Math.sin(l.index * 12.9898 + t * 78.233) + 1) * 0.5
-      const dur = base + jitter * (base * 0.4)
-      totalMs += dur
-      if (paged) pagedHits += 1
-      const cur = perLayer.get(l.index) ?? { hits: 0, total: 0 }
-      cur.hits += 1
-      cur.total += dur
-      perLayer.set(l.index, cur)
-
-      socket.emit("layer:step", {
-        layerIndex: l.index,
-        location: onGpu ? "gpu" : l.location,
-        durationMs: dur,
-        paged,
-        token: t,
-      })
-      // Persist lastMs / hits in batches
-      if (Math.random() < 0.05) {
-        await db.layer.updateMany({
-          where: { modelId: l.modelId, index: l.index },
-          data: { hits: { increment: 1 }, lastMs: dur },
-        })
-      }
-    }
-    // Yield so tokens can interleave with layer steps
-    await sleep(2)
-  }
-
-  return {
-    totalMs,
-    pagedHits,
-    perLayer: new Map(
-      Array.from(perLayer.entries()).map(([k, v]) => [k, { hits: v.hits, meanMs: v.total / v.hits }]),
-    ),
-  }
-}
-
 async function handleChatSend(payload: ChatSendPayload, socket: import("socket.io").Socket) {
   if (!currentModelId) {
     socket.emit("engine:error", { error: "No model loaded" })
     return
   }
+  if (engineStatus().mode !== "real") {
+    socket.emit("engine:error", { error: "The real engine is not running — load a downloaded model first." })
+    return
+  }
+
   if (activeStream) activeStream.abort()
   const ac = new AbortController()
   activeStream = ac
 
   const session = await db.chatSession.findUnique({ where: { id: payload.sessionId } })
   const temp = payload.temperature ?? session?.temperature ?? 0.7
-  const maxTok = payload.maxTokens ?? session?.maxTokens ?? 256
+  const maxTok = payload.maxTokens ?? session?.maxTokens ?? 512
   const sys = payload.systemPrompt ?? session?.systemPrompt ?? ""
 
   socket.emit("chat:start", { sessionId: payload.sessionId })
 
-  // Persist the user message immediately
   await db.chatMessage.create({
     data: {
       sessionId: payload.sessionId,
@@ -415,46 +570,66 @@ async function handleChatSend(payload: ChatSendPayload, socket: import("socket.i
     },
   })
 
+  // Seed the conversation with prior turns so the model has context.
+  const history = await db.chatMessage.findMany({
+    where: { sessionId: payload.sessionId },
+    orderBy: { createdAt: "asc" },
+    take: 40,
+  })
+
+  const messages: ChatMessage[] = [
+    ...(sys ? [{ role: "system" as const, content: sys }] : []),
+    ...history.map((m) => ({
+      role: (m.role === "assistant" ? "assistant" : m.role === "system" ? "system" : "user") as ChatMessage["role"],
+      content: m.content,
+    })),
+  ]
+
+  const animator = startLayerAnimator(socket, ac.signal)
   const t0 = Date.now()
   let tokensProduced = 0
+  let firstTokenAt = 0
+  let content = ""
+  let promptTokens: number | undefined
 
-  // Stream tokens AND run the layer animation in parallel — the layer
-  // animation ticks once per token produced (roughly), which is exactly
-  // how a real forward pass behaves.
-  const animPromise = streamLayerAnimation(
-    currentLayers,
-    Math.min(maxTok, 64),
-    socket,
-    ac.signal,
-  )
+  try {
+    const result = await streamChat(
+      messages,
+      { temperature: temp, maxTokens: maxTok, signal: ac.signal },
+      (tok) => {
+        if (firstTokenAt === 0) firstTokenAt = Date.now()
+        tokensProduced += 1
+        content += tok
+        socket.emit("chat:token", { token: tok, sessionId: payload.sessionId })
+      },
+    )
+    content = result.content || content
+    promptTokens = result.promptTokens
+  } catch (err) {
+    if (!ac.signal.aborted) {
+      console.error("[inference-service] chat failed:", err)
+      socket.emit("engine:error", { error: String(err), log: recentLog().slice(-10) })
+    }
+  }
 
-  const { content } = await generateTokens(
-    payload.prompt,
-    sys,
-    temp,
-    maxTok,
-    (tok) => {
-      tokensProduced += 1
-      socket.emit("chat:token", { token: tok, sessionId: payload.sessionId })
-    },
-    ac.signal,
-  )
-
-  const anim = await animPromise
-  const elapsed = (Date.now() - t0) / 1000
+  const anim = animator.stop()
+  const elapsed = firstTokenAt > 0 ? (Date.now() - firstTokenAt) / 1000 : (Date.now() - t0) / 1000
   const tps = elapsed > 0 ? tokensProduced / elapsed : 0
 
-  // Persist assistant reply
   await db.chatMessage.create({
     data: {
       sessionId: payload.sessionId,
       role: "assistant",
       content,
+      tokensIn: promptTokens ?? 0,
       tokensOut: tokensProduced,
       tokensPerSec: tps,
       strategy: currentStrategy,
     },
   })
+
+  await persistAnimatorStats(currentModelId, anim.perLayer)
+  await emitLayerState(socket)
 
   socket.emit("chat:done", {
     sessionId: payload.sessionId,
@@ -469,8 +644,6 @@ async function handleChatSend(payload: ChatSendPayload, socket: import("socket.i
     },
   })
 
-  // Push fresh layer state because stats changed
-  await emitLayerState(socket)
   activeStream = null
 }
 
@@ -481,13 +654,13 @@ async function handleChatSend(payload: ChatSendPayload, socket: import("socket.i
 io.on("connection", (socket) => {
   console.log(`[inference-service] connected: ${socket.id}`)
 
-  // Send current engine state on connect
   if (currentModelId) {
     emitLayerState(socket)
     socket.emit("engine:loaded", {
       modelId: currentModelId,
       strategy: currentStrategy,
-      mode: "demo",
+      mode: engineStatus().mode,
+      nGpuLayers: gpuLayerCount(),
     })
   } else {
     socket.emit("engine:idle", {})
@@ -495,6 +668,7 @@ io.on("connection", (socket) => {
 
   socket.on("engine:load", async (data: { modelId: string; strategy?: Strategy }) => {
     try {
+      if (activeStream) activeStream.abort()
       await loadEngine(data.modelId, data.strategy ?? "balanced", socket)
     } catch (err) {
       socket.emit("engine:error", { error: String(err) })
@@ -503,6 +677,7 @@ io.on("connection", (socket) => {
 
   socket.on("engine:unload", async () => {
     if (activeStream) activeStream.abort()
+    await stopEngine()
     currentModelId = null
     currentLayers = []
     socket.emit("engine:unloaded", {})
@@ -536,30 +711,39 @@ io.on("connection", (socket) => {
     if (activeStream) activeStream.abort()
   })
 
+  socket.on("engine:status", () => {
+    socket.emit("engine:loaded", {
+      modelId: currentModelId,
+      strategy: currentStrategy,
+      mode: engineStatus().mode,
+      nGpuLayers: gpuLayerCount(),
+    })
+  })
+
   socket.on("disconnect", () => {
     console.log(`[inference-service] disconnected: ${socket.id}`)
   })
 })
 
-io.listen(PORT, () => {
-  console.log(`[inference-service] listening on :${PORT}`)
-})
+io.listen(PORT)
+console.log(`[inference-service] listening on :${PORT}`)
+refreshHardwareBudget().catch((e) => console.error("[inference-service] hardware detect failed:", e))
 
-// Heartbeat so we can see the service is alive in the log
 setInterval(() => {
-  console.log(`[inference-service] heartbeat — model=${currentModelId} layers=${currentLayers.length} clients=${io.sockets.sockets.size}`)
+  console.log(
+    `[inference-service] heartbeat — model=${currentModelId} layers=${currentLayers.length} mode=${engineStatus().mode} clients=${io.sockets.sockets.size}`,
+  )
 }, 15000)
 
-process.on("SIGTERM", () => {
+process.on("SIGTERM", async () => {
   console.log("[inference-service] SIGTERM received")
+  await stopEngine()
   io.close()
   process.exit(0)
 })
-process.on("SIGINT", () => {
+process.on("SIGINT", async () => {
   console.log("[inference-service] SIGINT received")
+  await stopEngine()
   io.close()
   process.exit(0)
-})
-process.on("exit", (code) => {
-  console.log(`[inference-service] exiting with code ${code}`)
 })

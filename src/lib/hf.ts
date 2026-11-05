@@ -72,7 +72,7 @@ export async function searchHfModels(opts: {
 export async function getHfRepo(repo: string, revision = "main"): Promise<HfRepoInfo> {
   // Don't encodeURIComponent the repo — the slash between author/name is
   // significant and HF rejects %2F. Path segments are safe without encoding.
-  const url = `${HF_BASE}/api/models/${repo}/revision/${encodeURIComponent(revision)}`
+  const url = `${HF_BASE}/api/models/${repo}/revision/${encodeURIComponent(revision)}?blobs=true`
   const res = await fetch(url, { headers: { Accept: "application/json" } })
   if (!res.ok) throw new Error(`HF repo info failed (${res.status})`)
   return (await res.json()) as HfRepoInfo
@@ -180,7 +180,7 @@ export async function downloadLayerFile(
   let lastTick = 0
 
   // Tee the response body: write to file, feed sha, track bytes
-  const nodeStream = Readable.fromWeb(res.body as unknown as ReadableStream<Uint8Array>)
+  const nodeStream = Readable.fromWeb(res.body as any)
   const out = createWriteStream(outPath)
 
   const teed = new Readable({

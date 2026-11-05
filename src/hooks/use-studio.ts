@@ -115,6 +115,11 @@ export interface PassLogEntry {
 }
 
 const WS_PORT = 3003
+// NEXT_PUBLIC_WS_URL (e.g. http://127.0.0.1:3003) connects straight to the
+// inference service. The XTransformPort fallback only works behind the Caddy
+// proxy on :81; opening the app on :3000 directly leaves the handshake with
+// nowhere to go and the socket silently never connects.
+const WS_URL = process.env.NEXT_PUBLIC_WS_URL
 
 export const useStudio = create<StudioState>((set, get) => ({
   socket: null,
@@ -148,7 +153,7 @@ export const useStudio = create<StudioState>((set, get) => ({
   connect: () => {
     if (get().socket) return
     // path: "/" MUST match the server's path: "/" — see mini-services/inference-service/index.ts
-    const socket = IoClient("/?XTransformPort=" + WS_PORT, {
+    const socket = IoClient(WS_URL || ("/?XTransformPort=" + WS_PORT), {
       path: "/",
       transports: ["websocket", "polling"],
       reconnection: true,
@@ -282,6 +287,13 @@ export const useStudio = create<StudioState>((set, get) => ({
     if (!socket || !modelId) return
     await get().ensureSession()
     socket.emit("engine:load", { modelId, strategy: get().strategy })
+  },
+
+  unloadEngine: async () => {
+    const socket = get().socket
+    const modelId = get().currentModelId
+    if (!socket || !modelId) return
+    socket.emit("engine:unload")
   },
 
   setStrategy: async (s) => {

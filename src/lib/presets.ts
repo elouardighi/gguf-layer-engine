@@ -82,10 +82,10 @@ export function findPreset(repo: string): ModelPreset | undefined {
 
 /** Recommended hardware budget for the studio (used by the layer engine). */
 export const HARDWARE_BUDGET = {
-  /** Mock VRAM budget when running without a real GPU — 12 GB */
-  vramMB: 12288,
-  /** Mock system RAM for KV cache / context — 32 GB */
-  ramMB: 32768,
-  /** Mock NVMe pager capacity — effectively unlimited, just for display */
+  /** Real GPU budget; overridden in the inference service after detection. */
+  vramMB: Number(process.env.STUDIO_VRAM_MB ?? 16384),
+  /** System RAM available for KV cache / context. */
+  ramMB: Number(process.env.STUDIO_RAM_MB ?? 15360),
+  /** NVMe pager capacity — effectively unlimited, just for display. */
   nvmeMB: 512 * 1024,
 }

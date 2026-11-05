@@ -13,9 +13,15 @@
 
 import "server-only"
 import { spawn, ChildProcess } from "node:child_process"
+import { existsSync } from "node:fs"
+import { join } from "node:path"
 import { db } from "@/lib/db"
 import { getLayersForModel, planPlacement, applyPlan, type Strategy } from "@/lib/layer-engine"
 import { modelLocalPath } from "@/lib/hf"
+
+const SERVER_BIN =
+  process.env.LLAMA_SERVER_BIN ??
+  join(process.cwd(), "bin", "llama", process.platform === "win32" ? "llama-server.exe" : "llama-server")
 
 export interface LlamaStatus {
   available: boolean
@@ -36,17 +42,13 @@ let currentMode: "real" | "demo" | "unknown" = "unknown"
 
 /** Check whether a llama-server binary is reachable */
 export async function detectLlamaServer(): Promise<boolean> {
-  // Probe a couple of common names; if `which` finds one we're good.
-  const probe = (cmd: string) =>
-    new Promise<boolean>((resolve) => {
-      const child = spawn("sh", ["-c", `command -v ${cmd}`], { stdio: "ignore" })
-      child.on("exit", (code) => resolve(code === 0))
-      child.on("error", () => resolve(false))
-    })
-  const a = await probe("llama-server")
-  if (a) return true
-  const b = await probe("llama.cpp_server")
-  return b
+  if (existsSync(SERVER_BIN)) return true
+  const cmd = process.platform === "win32" ? "where" : "which"
+  return new Promise<boolean>((resolve) => {
+    const child = spawn(cmd, ["llama-server"], { stdio: "ignore", windowsHide: true })
+    child.on("exit", (code) => resolve(code === 0))
+    child.on("error", () => resolve(false))
+  })
 }
 
 export function currentStatus(): LlamaStatus {
@@ -118,19 +120,25 @@ export async function loadModel(modelId: string, strategy: Strategy = "balanced"
   }
 
   const args = [
-    "--model", `${model.localPath}/${firstShard}`,
+    "--model", join(model.localPath, firstShard),
     "--ctx-size", String(model.contextSize),
     "--n-gpu-layers", String(ngl),
-    "--port", "8080",
     "--host", "127.0.0.1",
-    "--flash-attn",
-    "--mlock",
+    "--port", "8080",
+    "--parallel", "1",
     "--no-webui",
+    "--jinja",
+    "--no-kv-offload",
+    "--threads", String(Math.max(1, Math.floor((await import("node:os")).cpus().length / 2))),
   ]
 
   try {
-    currentProcess = spawn("llama-server", args, { stdio: "ignore", detached: false })
+    currentProcess = spawn(SERVER_BIN, args, { stdio: "ignore", windowsHide: true })
     currentMode = "real"
+    currentProcess.on("error", () => {
+      currentMode = "demo"
+      currentProcess = null
+    })
     currentProcess.on("exit", () => {
       currentProcess = null
     })

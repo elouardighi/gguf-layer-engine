@@ -7,11 +7,8 @@ const nextConfig: NextConfig = {
     ignoreBuildErrors: true,
   },
   reactStrictMode: false,
-  // Register the instrumentation hook (src/instrumentation.ts) which spawns
-  // the inference WebSocket service as a child of the Next.js process.
-  experimental: {
-    instrumentationHook: true,
-  },
+  // instrumentation.ts is enabled by default in Next.js 15+, so no experimental
+  // flag is needed to spawn the inference WebSocket service on startup.
 };
 
 export default nextConfig;

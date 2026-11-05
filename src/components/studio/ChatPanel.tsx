@@ -22,6 +22,7 @@ export function ChatPanel() {
     stopChat,
     engineRunning,
     loadEngine,
+    socket,
     lastTokenStats,
   } = useStudio()
   const [input, setInput] = useState("")
@@ -57,6 +58,18 @@ export function ChatPanel() {
           {current?.repo ?? "—"}
         </div>
         <div className="ml-auto flex items-center gap-1.5">
+          {engineRunning && socket && (
+            <button
+              onClick={(e) => {
+                e.stopPropagation()
+                socket.emit("engine:unload")
+              }}
+              title="Unload model from the engine"
+              className="rounded-md border border-destructive/30 bg-destructive/10 px-2 py-0.5 text-[9px] font-mono text-destructive hover:bg-destructive/20"
+            >
+              Unload
+            </button>
+          )}
           {lastTokenStats && (
             <Badge variant="outline" className="text-[9px] py-0 px-1.5 h-4 font-mono">
               <Activity className="h-2.5 w-2.5 mr-1 text-primary" />

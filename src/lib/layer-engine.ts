@@ -80,81 +80,78 @@ export async function getLayersForModel(modelId: string): Promise<LayerState[]> 
   }))
 }
 
+/** Fraction of total VRAM each strategy may occupy, matching llama.cpp's
+ *  contiguous prefix offload (--n-gpu-layers). Keep in sync with the
+ *  inference-service placement algorithm. */
+const STRATEGY_VRAM_FRACTION: Record<Strategy, number> = {
+  speed: 0.715,
+  balanced: 0.57,
+  memory: 0.4,
+  manual: 0,
+}
+
+const VRAM_HARD_CAP_FRACTION = 0.79
+
 /** Compute a target placement plan for a model under a strategy */
 export function planPlacement(
   layers: LayerState[],
   strategy: Strategy,
   opts: { activeWindow?: number; contextBytes?: number } = {},
 ): LayerPlan {
-  const vramBudget = HARDWARE_BUDGET.vramMB * 1024 * 1024
-  const ramBudget = HARDWARE_BUDGET.ramMB * 1024 * 1024
-  const ctxBytes = opts.contextBytes ?? Math.round(8192 * 4096) // ~32MB @ 8k ctx
+  const vramTotal = HARDWARE_BUDGET.vramMB * 1024 * 1024
+  const ctxBytes = opts.contextBytes ?? 8192 * 4096
 
   const placement = new Map<number, LayerLocation>()
   let vramBytes = 0
-  let ramBytes = ctxBytes // KV cache lives here
+  let ramBytes = ctxBytes
   let nvmeBytes = 0
 
-  // Always pin user-pinned layers into VRAM first
-  for (const l of layers) {
-    if (l.pinned) {
+  if (vramTotal <= 0) {
+    for (const l of layers) {
+      placement.set(l.index, "ram")
+      ramBytes += Number(l.sizeBytes)
+    }
+    return { placement, vramBytes, ramBytes, nvmeBytes, strategy }
+  }
+
+  const fraction =
+    strategy === "manual" ? 0 : Math.min(VRAM_HARD_CAP_FRACTION, STRATEGY_VRAM_FRACTION[strategy])
+  const vramBudget = vramTotal * fraction
+
+  // Greedy contiguous prefix: llama.cpp cannot skip a block and offload
+  // the next one.
+  let prefixEnd = 0
+  let prefixBytes = 0
+  if (vramBudget > 0) {
+    for (const l of layers) {
+      const size = Number(l.sizeBytes)
+      if (prefixBytes + size > vramBudget) break
+      prefixBytes += size
+      prefixEnd += 1
+    }
+  }
+  const firstColdPin = layers.findIndex((l) => l.pinned && l.location !== "gpu")
+  if (firstColdPin >= 0) prefixEnd = Math.min(prefixEnd, firstColdPin)
+  const lastGpuPin = layers.reduce((acc, l, i) => (l.pinned && l.location === "gpu" ? i : acc), -1)
+  if (lastGpuPin >= 0) prefixEnd = Math.max(prefixEnd, lastGpuPin + 1)
+  prefixEnd = Math.max(0, Math.min(prefixEnd, layers.length))
+
+  const ramForPages = Math.max(0, HARDWARE_BUDGET.ramMB * 1024 * 1024 * 0.6 - ctxBytes)
+
+  layers.forEach((l, i) => {
+    const size = Number(l.sizeBytes)
+    if (i < prefixEnd) {
       placement.set(l.index, "gpu")
-      vramBytes += Number(l.sizeBytes)
-    }
-  }
-
-  const unpinned = layers.filter((l) => !l.pinned)
-
-  if (strategy === "speed") {
-    // Fill VRAM greedily, in layer order; the rest goes to NVMe
-    for (const l of unpinned) {
-      const size = Number(l.sizeBytes)
-      if (vramBytes + size <= vramBudget) {
-        placement.set(l.index, "gpu")
-        vramBytes += size
-      } else {
-        placement.set(l.index, "nvme")
-        nvmeBytes += size
-      }
-    }
-  } else if (strategy === "balanced") {
-    // Keep ~70% in VRAM, push oldest ~30% to NVMe
-    const keep = Math.floor(unpinned.length * 0.7)
-    for (let i = 0; i < unpinned.length; i++) {
-      const l = unpinned[i]
-      const size = Number(l.sizeBytes)
-      if (i < keep && vramBytes + size <= vramBudget) {
-        placement.set(l.index, "gpu")
-        vramBytes += size
-      } else {
-        placement.set(l.index, "nvme")
-        nvmeBytes += size
-      }
-    }
-  } else if (strategy === "memory") {
-    // Rolling window: only N layers in VRAM at a time
-    const window = clamp(opts.activeWindow ?? 8, 1, unpinned.length)
-    const start = Math.floor((unpinned.length - window) / 2)
-    for (let i = 0; i < unpinned.length; i++) {
-      const l = unpinned[i]
-      const size = Number(l.sizeBytes)
-      if (i >= start && i < start + window && vramBytes + size <= vramBudget) {
-        placement.set(l.index, "gpu")
-        vramBytes += size
-      } else {
-        placement.set(l.index, "nvme")
-        nvmeBytes += size
-      }
-    }
-  } else {
-    // manual: only pinned layers go to GPU, the rest stays on NVMe
-    for (const l of unpinned) {
+      vramBytes += size
+    } else if (ramBytes - ctxBytes + size <= ramForPages) {
+      placement.set(l.index, "ram")
+      ramBytes += size
+    } else {
       placement.set(l.index, "nvme")
-      nvmeBytes += Number(l.sizeBytes)
+      nvmeBytes += size
     }
-  }
+  })
 
-  // RAM is always at least the context; pinned layers don't count toward RAM
   return { placement, vramBytes, ramBytes, nvmeBytes, strategy }
 }
 

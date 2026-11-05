@@ -16,8 +16,8 @@ const geistMono = Geist_Mono({
 export const metadata: Metadata = {
   title: "Layered AI Studio — GGUF Layer Engine",
   description:
-    "Local web AI studio for layered GGUF models. Connects to Hugging Face, streams inference through a GPU/RAM/NVMe layer pager. Default target: Qwen3.8-27B-UD-Q4_K_XL-layers (50 shards).",
-  keywords: ["AI studio", "GGUF", "layered model", "llama.cpp", "Hugging Face", "Qwen3", "VRAM", "NVMe pager"],
+    "Local web AI studio for layered GGUF models. Connects to Hugging Face, streams inference through a GPU/RAM/NVMe layer pager. Default target: Qwen3.8-27B-UD-Q4_K_XL layer package (65 layers, Mesh LLM).",
+  keywords: ["AI studio", "GGUF", "layered model", "llama.cpp", "Mesh LLM", "Hugging Face", "Qwen3", "VRAM", "NVMe pager"],
 };
 
 export default function RootLayout({

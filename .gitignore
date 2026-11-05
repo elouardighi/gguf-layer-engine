@@ -49,6 +49,14 @@ dev.out.log
 test
 prompt
 
+# local model weights and downloaded runtimes
+/models/
+/bin/
+
 server.log
 # Skills directory
 /skills/
+
+# sqlite runtime sidecar files
+*.db-shm
+*.db-wal
